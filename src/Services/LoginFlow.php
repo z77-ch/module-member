@@ -1,0 +1,565 @@
+<?php
+
+namespace Z77\Module\Member\Services;
+
+use Z77\Core\DI;
+use Z77\Module\Member\Entities\MemberAccount;
+use Z77\Module\Member\Entities\MemberPendingLogin;
+use Z77\Module\Member\Entities\MemberToken;
+use Z77\Persistence\Resolver\DataSourceResolver;
+use Z77\Persistence\Resolver\UnifiedEntityManager;
+use Z77\Shared\Auth\TotpGuard;
+use Z77\Shared\Auth\TotpVault;
+use Z77\Shared\Mail\EmailMessage;
+
+/**
+ * The login story of the member module (B8 spec) — magic link, no password:
+ *
+ *   request()  the e-mail form submit: throttle per address (shared window
+ *              with registration), then ONE of three mails by account state
+ *              (spec table) — login link (confirmed/active), a fresh B7
+ *              confirmation link (registered), or the "no account here"
+ *              hint with the registration link (unknown). The page answer
+ *              is identical in every case (anti-oracle), and a waiting
+ *              record is opened for EVERY request (stage D).
+ *   redeem()   the link click, «here»: session on the READING device. Runs
+ *              without a question when the reading browser IS the
+ *              requesting one ({@see isRequestingBrowser()}).
+ *   approve()  the link click, «confirm»: releases the waiting record so the
+ *              REQUESTING device can sign in (spec 1.1.0, decision 5).
+ *   poll()     what the requesting device asks every few seconds until its
+ *              record is released — this is where its session is born.
+ *   logout()   ends the member session.
+ *
+ * Which device gets the session decides everything downstream: the TOTP
+ * prompt and the «angemeldet bleiben» key always follow the session, never
+ * the click.
+ *
+ * Login tokens live in the SAME store as confirmation tokens with
+ * purpose 'login' (B7 spec: one mechanism, two effects) — but short-lived:
+ * 15 minutes instead of 7 days.
+ */
+final class LoginFlow
+{
+    public const LOGIN_TTL_SECONDS = 900; // spec default: 15 min
+
+    public const SESSION       = 'session';
+    public const TOTP_REQUIRED = 'totp-required';
+    public const DEAD          = 'dead';
+
+    /** poll(): the record is still waiting for the other device. */
+    public const WAITING  = 'waiting';
+    /** approve(): released — the requesting device takes it from here. */
+    public const APPROVED = 'approved';
+    /** poll(): the link was opened in THIS browser, another tab signed in — this one only steps aside. */
+    public const ELSEWHERE = 'elsewhere';
+
+    public const TOTP_INVALID = 'invalid';
+    public const TOTP_LOCKED  = 'locked';
+    /** The counters cannot count: every code is refused, the right one too. */
+    public const TOTP_UNAVAILABLE = 'unavailable';
+
+    /** Login mails per origin and hour when memberConfig names none. Generous: one address can be an office. */
+    public const DEFAULT_PER_IP = 30;
+
+    /** Landing after a successful login when memberConfig names none. */
+    public const DEFAULT_LANDING = '/member/main/profile';
+
+    /**
+     * @param \Closure(EmailMessage): bool $sendMail
+     * @param string $redeemUrl   absolute URL of the redeem action; token appended
+     * @param string $registerUrl absolute URL of the registration page (no-account mail)
+     * @param int    $mailsPerIp  login mails per origin and hour
+     */
+    public function __construct(
+        private MemberAccounts $accounts,
+        private TokenService $tokens,
+        private MemberThrottle $throttle,
+        private MemberSession $session,
+        private RegistrationFlow $registration,
+        private TotpVault $totpVault,
+        private TotpGuard $totpGuard,
+        private DeviceKeys $deviceKeys,
+        private PendingLogins $pending,
+        private \Closure $sendMail,
+        private string $redeemUrl,
+        private string $registerUrl,
+        private int $mailsPerIp = self::DEFAULT_PER_IP,
+    ) {
+    }
+
+    /** Production wiring — $confirmUrl feeds the embedded RegistrationFlow (registered case). */
+    public static function create(string $redeemUrl, string $registerUrl, string $confirmUrl): self
+    {
+        $uem = new UnifiedEntityManager(new DataSourceResolver(['file' => 'File']));
+
+        return new self(
+            new MemberAccounts($uem),
+            new TokenService($uem),
+            new MemberThrottle(
+                MemberThrottle::defaultDir(),
+                self::requestsPerHour(),
+            ),
+            new MemberSession(DI::getSessionManager()),
+            RegistrationFlow::create($confirmUrl),
+            MemberTotp::vault(),
+            MemberTotp::guard(),
+            DeviceKeys::create(),
+            new PendingLogins($uem),
+            static fn(EmailMessage $mail): bool => DI::getEmailService()->send($mail),
+            $redeemUrl,
+            $registerUrl,
+            self::requestsPerHourPerIp(),
+        );
+    }
+
+    /**
+     * How many login links one address / one browser may trigger per hour —
+     * memberConfig `loginRequestsPerHour`, default {@see MemberThrottle::MAX_PER_HOUR}.
+     * Both layers run on this one number: the per-address throttle here and
+     * the per-session limit of the login form ({@see \Z77\Module\Member\Ui\Controllers\Main\LoginController}).
+     * Raise it on an installation where support or testing needs more; the
+     * limit protects a stranger's mailbox from being flooded through this
+     * form, so it stays a number, not a switch.
+     */
+    public static function requestsPerHour(): int
+    {
+        $configured = (int) (DI::getModuleManager()
+            ->getModuleConfig('member')
+            ?->get('loginRequestsPerHour', MemberThrottle::MAX_PER_HOUR) ?? MemberThrottle::MAX_PER_HOUR);
+
+        return $configured > 0 ? $configured : MemberThrottle::MAX_PER_HOUR;
+    }
+
+    /** memberConfig `loginRequestsPerHourPerIp`, default {@see DEFAULT_PER_IP}. */
+    public static function requestsPerHourPerIp(): int
+    {
+        $configured = (int) (DI::getModuleManager()
+            ->getModuleConfig('member')
+            ?->get('loginRequestsPerHourPerIp', self::DEFAULT_PER_IP) ?? self::DEFAULT_PER_IP);
+
+        return $configured > 0 ? $configured : self::DEFAULT_PER_IP;
+    }
+
+    /**
+     * Where a signed-in member lands — memberConfig `afterLoginUrl`, default
+     * the profile. Every arrival uses it: the redeemed link, the confirmed
+     * second factor, the waiting page's poll, and a visitor who calls the login
+     * while already signed in.
+     *
+     * A project with a management area points this at that area; the module's
+     * own default stays the profile, because that is the only screen a bare
+     * member module has.
+     */
+    public static function landingUrl(): string
+    {
+        $configured = trim((string) (DI::getModuleManager()
+            ->getModuleConfig('member')
+            ?->get('afterLoginUrl', self::DEFAULT_LANDING) ?? self::DEFAULT_LANDING));
+
+        // Own installation only: an absolute URL here would send the member off
+        // the site after a successful login — a redirect target from config is
+        // still a redirect target.
+        return str_starts_with($configured, '/') && !str_starts_with($configured, '//')
+            ? $configured
+            : self::DEFAULT_LANDING;
+    }
+
+    /**
+     * The request submit. Always true — the visitor-facing answer never reveals
+     * whether the address has an account, in which state, or whether the
+     * throttle just swallowed the mail. Only the mail differs.
+     *
+     * A waiting record is opened in every case (stage D) and remembered in this
+     * device's session: the waiting page must look identical whether a link
+     * went out or not. Without a link it simply never turns green — which is
+     * also what a throttled visitor sees, deliberately. The throttle keeps
+     * doing its job; it just stops being visible.
+     *
+     * Two counters: the origin holds someone inventing a fresh address on every
+     * try, the address holds someone hammering one. ⚠️ The origin is asked
+     * FIRST: an origin over its limit must not use up a stranger's address
+     * allowance. $ip '' = no usable address, the address counter still holds.
+     */
+    public function request(string $email, bool $remember = false, ?int $now = null, string $ip = ''): bool
+    {
+        $now     = $now ?? time();
+        $origin = $ip === '' || $this->throttle->allowIp($ip, $this->mailsPerIp, $now);
+        if (!$origin) {
+            // The visitor must see nothing, the operator must: without an address, the log is not a list of people.
+            error_log('LoginFlow: login mail held back, this origin is over its hourly limit (' . $this->mailsPerIp . ')');
+        }
+        $allowed = $origin && $this->throttle->allow($email, $now);
+        $account = $allowed ? $this->accounts->findByEmail($email) : null;
+        $plain   = null;
+
+        // Order matters: the token first (the waiting record binds to its
+        // hash), then the record (the mail names its check digits), then the
+        // mail. A login token exists only for confirmed/active accounts.
+        if ($account !== null && !$account->isRegistered()) {
+            $plain = $this->tokens->issue(
+                (string)$account->getId(),
+                MemberToken::PURPOSE_LOGIN,
+                self::LOGIN_TTL_SECONDS,
+                $now,
+                $remember
+            );
+        }
+
+        $record = $this->pending->open(
+            $plain !== null ? hash('sha256', $plain) : null,
+            DeviceKeys::label((string)($_SERVER['HTTP_USER_AGENT'] ?? '')),
+            $remember,
+            self::LOGIN_TTL_SECONDS,
+            $now
+        );
+        $this->session->setPendingLoginId((string)$record->getId());
+
+        if ($allowed) {
+            ($this->sendMail)(match (true) {
+                $plain !== null   => $this->loginMail($account, $plain, $record),
+                $account === null => $this->noAccountMail($email),
+                default           => $this->registration->confirmMailFor($account, $now),
+            });
+        }
+
+        return true;
+    }
+
+    /** The waiting record of THIS device, or null (none, or past its window). */
+    public function currentPending(?int $now = null): ?MemberPendingLogin
+    {
+        $id = $this->session->pendingLoginId();
+        if ($id === null) {
+            return null;
+        }
+
+        $record = $this->pending->find($id);
+
+        return $record !== null && !$record->isExpired($now ?? time()) ? $record : null;
+    }
+
+    /**
+     * What the confirmation page shows BEFORE anything is consumed: the
+     * context of the request behind this link (digits, device, time), or null
+     * for a dead link. Returns the record too — a link whose waiting record is
+     * gone can still be used to sign in on the reading device, so the page
+     * then offers only that button.
+     *
+     * @return ?array{token: \Z77\Module\Member\Entities\MemberToken, pending: ?MemberPendingLogin}
+     */
+    public function linkContext(?string $plainToken, ?int $now = null): ?array
+    {
+        $now        = $now ?? time();
+        $plainToken = trim((string)$plainToken);
+        if ($plainToken === '') {
+            return null;
+        }
+
+        $token = $this->tokens->inspect($plainToken, MemberToken::PURPOSE_LOGIN, $now);
+        if ($token === null) {
+            return null;
+        }
+
+        $record = $this->pending->findByTokenHash($token->getTokenHash());
+
+        return [
+            'token'   => $token,
+            'pending' => $record !== null && !$record->isExpired($now) && !$record->isApproved() ? $record : null,
+        ];
+    }
+
+    /**
+     * Is the browser opening the link the one that asked for it? True only
+     * when this session holds exactly the waiting record behind the link —
+     * the proof is the session cookie, which a mail scanner, a link preview
+     * or a stranger never carries. False says «not provably this browser»,
+     * never «another device»: an in-app mail browser, a different default
+     * browser or an expired session on the same phone all land here too.
+     */
+    public function isRequestingBrowser(?MemberPendingLogin $pending): bool
+    {
+        return $pending !== null && (string)$pending->getId() === $this->session->pendingLoginId();
+    }
+
+    /**
+     * «Anmeldung auf dem anderen Gerät zulassen» — consumes the link and releases the
+     * waiting record. NO session is created here: the reading device stays
+     * signed out, the requesting one picks it up in poll().
+     */
+    public function approve(?string $plainToken, ?int $now = null): string
+    {
+        $now        = $now ?? time();
+        $plainToken = trim((string)$plainToken);
+        if ($plainToken === '') {
+            return self::DEAD;
+        }
+
+        $token = $this->tokens->redeemToken($plainToken, MemberToken::PURPOSE_LOGIN, $now);
+        if ($token === null) {
+            return self::DEAD;
+        }
+
+        $account = $this->accountOf($token);
+        if ($account === null || $account->isRegistered()) {
+            return self::DEAD;
+        }
+
+        $record = $this->pending->findByTokenHash($token->getTokenHash());
+        if ($record === null || $record->isExpired($now)) {
+            // The request behind this link is gone (window passed, or it was
+            // already used up elsewhere) — nothing left to release.
+            return self::DEAD;
+        }
+
+        $this->pending->approve($record, (string)$account->getId());
+
+        return self::APPROVED;
+    }
+
+    /**
+     * The status poll of the WAITING device. 'waiting' until the other device
+     * confirms; then the session is born right here — with the TOTP prompt
+     * first when 2FA is on, and the device key going to THIS device, because
+     * this is where the tick was set (spec 1.1.0).
+     */
+    public function poll(?int $now = null): string
+    {
+        $now = $now ?? time();
+
+        // The link was opened in THIS browser, in another tab: redeem() has
+        // already signed this session in (or parked it at the code prompt)
+        // and deleted the record. The login lives on in that tab; this one
+        // steps aside instead of showing the same landing a second time —
+        // and instead of reporting a dead request next to a live session.
+        if ($this->session->currentAccountId($now) !== null
+            || $this->session->totpPendingAccountId($now) !== null) {
+            return self::ELSEWHERE;
+        }
+
+        $id = $this->session->pendingLoginId();
+        if ($id === null) {
+            return self::DEAD;
+        }
+
+        $record = $this->pending->find($id);
+        if ($record === null || $record->isExpired($now)) {
+            $this->session->clearPendingLogin();
+
+            return self::DEAD;
+        }
+        if (!$record->isApproved()) {
+            return self::WAITING;
+        }
+
+        $account = $this->accounts->findById((string)$record->getAccountRef());
+        if ($account === null) {
+            // Gone between the release on the other device and this poll: no
+            // session starts here; the waiting page reports a dead process.
+            $this->session->clearPendingLogin();
+            $this->pending->delete($record);
+
+            return self::DEAD;
+        }
+
+        $remember = $record->wantsRemember();
+        $this->session->clearPendingLogin();
+        $this->pending->delete($record); // the process is done, one way or another
+
+        if ($account->hasTotp()) {
+            $this->session->startTotpPending((string)$account->getId(), $remember, $now);
+
+            return self::TOTP_REQUIRED;
+        }
+
+        $this->session->start((string)$account->getId(), $now);
+        MemberLog::write('login', (string)$account->getId(), ['detail' => 'device']);
+        if ($remember) {
+            $this->deviceKeys->issueFor($account, null, $now);
+        }
+
+        return self::SESSION;
+    }
+
+    /**
+     * The link click. 'session': the member session exists from this moment.
+     * 'totp-required': the link was valid, but 2FA is active — the account
+     * parks at the code prompt (5-minute window), NO session yet. 'dead':
+     * unknown, expired, used, or the account vanished meanwhile — one
+     * answer, the request page with a hint.
+     */
+    public function redeem(?string $plainToken, ?int $now = null): string
+    {
+        $now ??= time();
+        $plainToken = trim((string)$plainToken);
+        if ($plainToken === '') {
+            return self::DEAD;
+        }
+
+        $token = $this->tokens->redeemToken($plainToken, MemberToken::PURPOSE_LOGIN, $now);
+        if ($token === null) {
+            return self::DEAD;
+        }
+
+        $account = $this->accountOf($token);
+        if ($account === null || $account->isRegistered()) {
+            // Vanished, or never confirmed (a login token should not exist for
+            // a registered account — defense in depth): no session.
+            return self::DEAD;
+        }
+
+        // «Hier anmelden» ends the other device's wait: its record dies with
+        // the link, so its poll answers 'dead' instead of hanging until the
+        // window closes.
+        $waiting = $this->pending->findByTokenHash($token->getTokenHash());
+        if ($waiting !== null) {
+            $this->pending->delete($waiting);
+        }
+
+        if ($account->hasTotp()) {
+            // The device key waits for the second factor (stage C).
+            $this->session->startTotpPending((string)$account->getId(), $token->wantsRemember(), $now);
+
+            return self::TOTP_REQUIRED;
+        }
+
+        $this->session->start((string)$account->getId(), $now);
+        MemberLog::write('login', (string)$account->getId(), ['detail' => 'redeem']);
+        if ($token->wantsRemember()) {
+            $this->deviceKeys->issueFor($account, null, $now);
+        }
+
+        return self::SESSION;
+    }
+
+    /**
+     * The code prompt submit (B8: only a valid app code creates the session).
+     * 'session' | 'invalid' (wrong or spent code, counted) | 'locked' (five
+     * failures → 15-minute window; the RIGHT code is refused too) | 'unavailable'
+     * (the counters cannot count: fails closed, the right code too) | 'dead'
+     * (nothing pending or the prompt window expired — back to the request page).
+     */
+    public function confirmTotp(string $code, ?int $now = null): string
+    {
+        $now ??= time();
+
+        $accountId = $this->session->totpPendingAccountId($now);
+        if ($accountId === null) {
+            return self::DEAD;
+        }
+
+        $check   = new TotpCodeCheck($this->accounts, $this->totpVault, $this->totpGuard);
+        $outcome = $check->judge($accountId, $code, $now, static function (MemberAccount $fresh, int $step): void {
+            $fresh->recordTotpStep($step);
+        });
+
+        switch ($outcome) {
+            case TotpCodeCheck::LOCKED:
+                return self::TOTP_LOCKED;
+            case TotpCodeCheck::WRONG:
+                return self::TOTP_INVALID;
+            case TotpCodeCheck::UNAVAILABLE:
+                return self::TOTP_UNAVAILABLE;
+            case TotpCodeCheck::GONE:
+                $this->session->clearTotpPending();
+
+                return self::DEAD; // account or vault entry gone — start over
+        }
+
+        $remember = $this->session->totpPendingRemember();
+
+        $this->session->clearTotpPending();
+        $this->session->start($accountId, $now);
+        MemberLog::write('login', $accountId, ['detail' => 'totp']);
+        $account = $remember ? $this->accounts->findById($accountId) : null;
+        if ($account !== null) {
+            $this->deviceKeys->issueFor($account, null, $now);
+        }
+
+        return self::SESSION;
+    }
+
+    /**
+     * Ends the member session AND this device's key — otherwise the next visit
+     * would silently resume and «abmelden» would be a lie.
+     */
+    public function logout(?int $now = null): void
+    {
+        // The ACL projection (auth_user, realm member) is NOT touched here:
+        // it is derived per request by MemberAuthBridge, and the logout
+        // response is a redirect — the next request's bridge run finds no
+        // member session and clears it before AccessGuard reads it.
+        $who = $this->session->currentAccountId($now);
+        $this->deviceKeys->forgetCurrent($now);
+        $this->session->end();
+        if ($who !== null && $who !== '') {
+            MemberLog::write('logout', $who);
+        }
+    }
+
+    /**
+     * «Alle Geräte abmelden» (profile): every device key of the account dies,
+     * this one included. The current session stays — the customer is standing
+     * on the profile page and asked for the OTHER devices to be locked out.
+     */
+    public function logoutAllDevices(MemberAccount $account): void
+    {
+        $this->deviceKeys->revokeAll($account);
+        MemberLog::write('logout.all', (string)$account->getId());
+    }
+
+    /**
+     * The account behind a redeemed token. A login token always has one — but
+     * `accountRef` is nullable since B7 v1.1.0 (invitations have no account),
+     * so the two redemption paths ask through here instead of each carrying
+     * its own null check.
+     */
+    private function accountOf(MemberToken $token): ?MemberAccount
+    {
+        $ref = $token->getAccountRef();
+
+        return $ref === null ? null : $this->accounts->findById($ref);
+    }
+
+    // ── the mails ──────────────────────────────────────────────────────────
+
+    /**
+     * The login mail. Subject and body carry the check digits and the context
+     * of the request — so the customer can tell an own login from one someone
+     * else started BEFORE clicking anything (spec 1.1.0).
+     */
+    private function loginMail(MemberAccount $account, string $plain, MemberPendingLogin $record): EmailMessage
+    {
+        // The account's language (ADR-056): the mail, and the page behind the link — a browser
+        // without the session lands on the confirmation page as a guest, and a guest's page
+        // speaks the URL's language.
+        $language = MemberLanguage::of($account);
+        $redeem   = MemberLanguage::url($this->redeemUrl, $language);
+        $link     = $redeem . (str_contains($redeem, '?') ? '&' : '?')
+                  . 'token=' . urlencode($plain);
+
+        return (new EmailMessage())
+            ->to($account->getEmail())
+            ->language($language)
+            // Digits first: a subject ENDING in a number is a spam signal (KAM_NUMSUBJECT).
+            ->subject(t('member.mail.login.subject', ['digits' => $record->getCheckDigits()], $language))
+            ->template('emails/login-link', 'Z77\\Module\\Member', [
+                'account'  => $account,
+                'loginUrl' => $link,
+                'digits'   => $record->getCheckDigits(),
+                'device'   => $record->getLabel(),
+                'when'     => date('d.m.Y, H:i', (int)strtotime($record->getRequestedAt())),
+            ]);
+    }
+
+    /** No account, no language of its own: the page's that asked (the current one). */
+    private function noAccountMail(string $email): EmailMessage
+    {
+        return (new EmailMessage())
+            ->to(MemberAccount::normalizeEmail($email))
+            ->subject(t('member.mail.noAccount.subject'))
+            ->template('emails/no-account', 'Z77\\Module\\Member', [
+                'registerUrl' => MemberLanguage::url($this->registerUrl, DI::getTranslator()->currentLanguage()),
+            ]);
+    }
+}

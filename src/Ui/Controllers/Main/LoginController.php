@@ -1,0 +1,319 @@
+<?php
+
+namespace Z77\Module\Member\Ui\Controllers\Main;
+
+use Z77\Core\DI,
+    Z77\Core\Http\Response\HtmlResponse,
+    Z77\Core\Http\Response\JsonResponse,
+    Z77\Core\Http\Response\RedirectResponse,
+    Z77\Module\Member\Services\LoginFlow,
+    Z77\Module\Member\Services\MemberAuth,
+    Z77\Module\Member\Ui\Controllers\AbstractMemberController,
+    Z77\Module\Member\Ui\Form\LoginFormDefinition,
+    Z77\Shared\Controller\PublicFormCheckTrait,
+    Z77\Shared\Forms\FormGuard,
+    Z77\Shared\Forms\PublicFormHandler,
+    Z77\Shared\Attributes\UrlLanguage
+;
+
+/**
+ * B8 login pages: request the magic link (public-form standard — the handler
+ * owns CSRF/bot/validation/rate limit; the flow adds the per-address throttle
+ * and the anti-oracle mail choice) and redeem it. A signed-in visitor is sent
+ * straight to the profile.
+ *
+ * #[UrlLanguage]: a guest act — the URL's language, whoever is signed in (ADR-056).
+ */
+#[UrlLanguage]
+class LoginController extends AbstractMemberController
+{
+    use PublicFormCheckTrait;
+
+    protected function indexAction(): HtmlResponse|RedirectResponse
+    {
+        if (MemberAuth::create()->current() !== null) {
+            return $this->redirect(LoginFlow::landingUrl());
+        }
+
+        $this->layoutManager->addJs('public-form', 'Z77\\Module\\Frontend', 'footer', true);
+
+        // Per-session limit on the same number as the address throttle
+        // (memberConfig `loginRequestsPerHour`) and silent: the login page
+        // answers every submit with the waiting page (MEM-005). The handler
+        // default (3/h, visible send error) would both break that and lie —
+        // «Versand fehlgeschlagen» for a limit a customer reaches
+        // legitimately (link in spam, second device).
+        $form = PublicFormHandler::create(new LoginFormDefinition())
+            ->withRateLimit(LoginFlow::requestsPerHour(), silent: true)
+            // Same silence for the country rule: every submit lands on the
+            // waiting page, a barred origin included — the page must not
+            // reveal the rule (MEM-005). Closes the gap that a blocked
+            // country could still request login links (review F2). No
+            // identityField here: the log keeps technical facts only.
+            ->withGeoGuard(silent: true);
+
+        $onValid = fn($valid): bool => $this->loginFlow()->request(
+            (string)$valid->get('email'),
+            (bool)$valid->get('remember'),
+            null,
+            (string)DI::getRequest()->getClientIp()
+        );
+
+        if ($form->process($onValid)) {
+            return $this->redirect('/member/main/login/warten');
+        }
+
+        return $this->html([
+            'pageTitle' => t('member.login.title'),
+            // «Konto gelöscht» is said ONCE, through the query: the session
+            // that would have carried a flash ended with the account.
+            'deleted'   => (string)DI::getRequest()->getGetParameter('konto') === 'geloescht',
+        ] + $form->viewContext());
+    }
+
+    /**
+     * PRG target — neutral by spec («falls ein Konto besteht, ist eine Mail
+     * unterwegs»), plus the check digits this request is waiting under. The
+     * page polls the status; a visitor who lands here without a waiting
+     * record (bookmark, reload after the window) just sees the neutral text.
+     */
+    protected function wartenAction(): HtmlResponse|RedirectResponse
+    {
+        // A reload of the waiting tab after the link signed this browser in
+        // (another tab): nothing to wait for any more, go where the login went.
+        if (MemberAuth::create()->current() !== null) {
+            return $this->redirect(LoginFlow::landingUrl());
+        }
+
+        $pending = $this->loginFlow()->currentPending();
+
+        if ($pending !== null) {
+            $this->layoutManager->addJs('login-wait', self::NAMESPACE, 'footer', true);
+        }
+
+        return $this->html([
+            'pageTitle' => t('member.wait.title'),
+            'digits'    => $pending?->getCheckDigits() ?? '',
+            'repeated'  => $this->askedBefore(),
+        ]);
+    }
+
+    /**
+     * Has this browser already asked for a link in the last hour?
+     *
+     * ⚠️ The one thing this page may react to. The address throttle is SILENT
+     * by design (MEM-005): past the limit nothing is sent and the waiting page
+     * appears as always, because a visible difference would tell a stranger
+     * whether an address has an account. The cost was that the customer whose
+     * link went to the spam folder keeps asking, walks into the limit, and
+     * waits for a mail that will never arrive — with the page still inviting
+     * «Erneut anfordern».
+     *
+     * The session's own request count closes that gap without opening the
+     * oracle: it says what THIS visitor just did, never anything about an
+     * account. So the page can offer the advice that actually helps — look in
+     * the spam folder, the first link is still valid, stop asking — to exactly
+     * the person who needs it.
+     *
+     * A visitor using a fresh private window every time never sees it. That is
+     * accepted: it is not the person this helps, and the address throttle
+     * holds either way.
+     */
+    private function askedBefore(): bool
+    {
+        return FormGuard::forKey((new LoginFormDefinition())->guardKey())->sendCount() >= 2;
+    }
+
+    /** The old PRG target — kept so bookmarked/queued links do not 404. */
+    protected function dankeAction(): RedirectResponse
+    {
+        return $this->redirect('/member/main/login/warten');
+    }
+
+    /**
+     * The status poll of the waiting device (JSON). Says only how far its OWN
+     * request got — never anything about an account, and never about someone
+     * else's record: the id comes from this browser's session, nowhere else.
+     */
+    protected function statusAction(): JsonResponse
+    {
+        $outcome = $this->loginFlow()->poll();
+
+        return new JsonResponse(match ($outcome) {
+            LoginFlow::SESSION       => ['state' => 'session', 'redirect' => LoginFlow::landingUrl()],
+            LoginFlow::TOTP_REQUIRED => ['state' => 'session', 'redirect' => '/member/main/login/totp'],
+            LoginFlow::WAITING       => ['state' => 'waiting'],
+            // Signed in (or at the code prompt) in the tab the link opened —
+            // this tab stops and offers the way on only as a fallback link.
+            LoginFlow::ELSEWHERE     => ['state' => 'elsewhere', 'link' => $this->hasTotpPending()
+                ? '/member/main/login/totp'
+                : LoginFlow::landingUrl()],
+            default                  => ['state' => 'dead'],
+        });
+    }
+
+    /**
+     * The link click. Opened in the browser that ASKED for it, it signs in
+     * right away — no question, nothing to compare. Anywhere else it is the
+     * confirmation page (spec 1.1.0, decision 5): GET shows what was
+     * requested (time, device, check digits) and two buttons; POST decides
+     * WHICH device gets the session:
+     *
+     *   here    → this device signs in (the primary button)
+     *   confirm → releases the waiting record, the requesting device signs in
+     *
+     * A link whose waiting record is gone still offers «hier anmelden».
+     *
+     * ⚠️ The same-browser path grants a session on a GET — the one exception
+     * to «access only through a POST» (topics/member.md). It holds because the
+     * GET alone is not enough: the session must carry the waiting record
+     * behind this very link, and a mail scanner or link preview never carries
+     * that cookie. They all land on the confirmation page, which changes
+     * nothing until a button is pressed.
+     */
+    protected function redeemAction(): HtmlResponse|RedirectResponse
+    {
+        $request = DI::getRequest();
+        $flow    = $this->loginFlow();
+        $token   = (string)($request->isPost()
+            ? $request->getPostParameter('token')
+            : $request->getGetParameter('token'));
+
+        if ($request->isPost() && DI::getCsrfService()->validate((string)$request->getPostParameter('csrf_token'))) {
+            if ((string)$request->getPostParameter('decision') === 'confirm') {
+                if ($flow->approve($token) === LoginFlow::APPROVED) {
+                    return $this->html([
+                        'pageTitle' => t('member.redeem.confirmedTitle'),
+                        'confirmed' => true,
+                        'pending'   => null,
+                        'token'     => '',
+                    ]);
+                }
+
+                return $this->deadLink();
+            }
+
+            return $this->signedIn($flow->redeem($token));
+        }
+
+        $context = $flow->linkContext($token);
+        if ($context === null) {
+            return $this->deadLink();
+        }
+
+        if ($flow->isRequestingBrowser($context['pending'])) {
+            return $this->signedIn($flow->redeem($token));
+        }
+
+        return $this->html([
+            'pageTitle' => t('member.redeem.title'),
+            'confirmed' => false,
+            'pending'   => $context['pending'],
+            'token'     => $token,
+        ]);
+    }
+
+    /** Where a redeemed link leads: the landing, the code prompt, or the dead-link hint. */
+    private function signedIn(string $outcome): RedirectResponse
+    {
+        return match ($outcome) {
+            LoginFlow::SESSION       => $this->redirect(LoginFlow::landingUrl()),
+            LoginFlow::TOTP_REQUIRED => $this->redirect('/member/main/login/totp'),
+            default                  => $this->deadLink(),
+        };
+    }
+
+    /**
+     * A dead link — but not always a failure.
+     *
+     * When the browser asking is ALREADY signed in, the link is spent BECAUSE
+     * this browser spent it: a reload, the back button, a second click on the
+     * same mail. Answering that with «fordern Sie einen neuen an» is a false
+     * alarm on top of a working session, and it pushes a customer to request a
+     * link they do not need — against an address that is throttled. So that
+     * case just goes where the login would have gone anyway.
+     *
+     * The sentence stays for the situation it actually describes: no session,
+     * and a link that expired, was used elsewhere, or never existed.
+     */
+    private function deadLink(): RedirectResponse
+    {
+        if (MemberAuth::create()->current() !== null) {
+            return $this->redirect(LoginFlow::landingUrl());
+        }
+
+        $this->messageService->pushFlashAfterRedirect(
+            'error',
+            t('member.login.deadLink')
+        );
+
+        return $this->redirect('/member/main/login');
+    }
+
+    /**
+     * The 2FA interstitial (B8: only the valid app code creates the session).
+     * Reachable only while a redeemed link parks at the prompt (5-minute
+     * window) — otherwise back to the request page.
+     */
+    protected function totpAction(): HtmlResponse|RedirectResponse
+    {
+        $request = DI::getRequest();
+        $flow    = $this->loginFlow();
+
+        if ($request->isPost()) {
+            if (!DI::getCsrfService()->validate((string)$request->getPostParameter('csrf_token'))) {
+                return $this->redirect('/member/main/login/totp');
+            }
+
+            $outcome = $flow->confirmTotp((string)$request->getPostParameter('code'));
+
+            if ($outcome === LoginFlow::SESSION) {
+                return $this->redirect(LoginFlow::landingUrl());
+            }
+            if ($outcome === LoginFlow::DEAD) {
+                $this->messageService->pushFlashAfterRedirect(
+                    'error',
+                    t('member.login.expired')
+                );
+
+                return $this->redirect('/member/main/login');
+            }
+
+            return $this->html([
+                'pageTitle' => t('member.totp.title'),
+                'error'     => match ($outcome) {
+                    LoginFlow::TOTP_LOCKED      => t('member.totp.locked'),
+                    LoginFlow::TOTP_UNAVAILABLE => t('member.totp.unavailable'),
+                    default                     => t('member.totp.invalid'),
+                },
+            ]);
+        }
+
+        if (!$this->hasTotpPending()) {
+            return $this->redirect('/member/main/login');
+        }
+
+        return $this->html(['pageTitle' => t('member.totp.title'), 'error' => '']);
+    }
+
+    private function hasTotpPending(): bool
+    {
+        return (new \Z77\Module\Member\Services\MemberSession(DI::getSessionManager()))
+            ->totpPendingAccountId() !== null;
+    }
+
+    /** Per-field blur validation (public-form standard). */
+    protected function checkAction(): JsonResponse
+    {
+        return $this->blurCheck(new LoginFormDefinition());
+    }
+
+    private function loginFlow(): LoginFlow
+    {
+        return LoginFlow::create(
+            $this->absoluteUrl('/member/main/login/redeem'),
+            $this->absoluteUrl('/member/main/register'),
+            $this->absoluteUrl('/member/main/confirm'),
+        );
+    }
+}

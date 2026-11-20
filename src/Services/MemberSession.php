@@ -1,0 +1,242 @@
+<?php
+
+namespace Z77\Module\Member\Services;
+
+use Z77\Core\Session\SessionManager;
+
+/**
+ * The member session (B8): which account is signed in, carried by the kernel
+ * session. Short-lived by design — it ends with the browser (cookie lifetime
+ * 0, SessionManager) or after inactivity (spec default: 2 hours); the
+ * long-lived path is the revocable device key («angemeldet bleiben», stage C),
+ * never the session itself.
+ *
+ * The session id is regenerated on start and end (fixation defense); in CLI
+ * (harness) the kernel session is a plain array and regeneration is skipped.
+ */
+final class MemberSession
+{
+    public const IDLE_SECONDS = 7200; // spec default: 2 h inactivity
+
+    /** How long the TOTP interstitial may take between link click and code. */
+    public const TOTP_PENDING_SECONDS = 300;
+
+    private const KEY_ACCOUNT      = 'member.accountId';
+    private const KEY_LAST_SEEN    = 'member.lastSeenAt';
+    private const KEY_TOTP_PENDING = 'member.totpPendingId';
+    private const KEY_TOTP_SINCE   = 'member.totpPendingAt';
+    private const KEY_TOTP_REMEMBER = 'member.totpPendingRemember';
+    private const KEY_PENDING_LOGIN = 'member.pendingLoginId';
+    /** A running 2FA setup (TotpSetup): vault ciphertext, never the plain secret. */
+    private const KEY_TOTP_ENROLMENT = 'member.totpEnrolment';
+
+    /**
+     * ADR-037: the reference the signed-in account CHOSE to work for. Written
+     * only by TenantChoice::choose() after the check against the available set;
+     * read only through TenantChoice::activeRef(), which falls back to
+     * the home — this raw value may name a grant that has since been paused
+     * or removed, and the raw reader deliberately does not know.
+     */
+    private const KEY_ACTIVE_TENANT = 'member.activeTenantRef';
+
+    public function __construct(private SessionManager $session)
+    {
+    }
+
+    /**
+     * Signs the account in: fresh session id, idle clock starts now.
+     *
+     * One identity per browser: signing in at this door closes the other one
+     * (the backend password login) by dropping its ACL identity. Written
+     * through the session directly and not via AuthService — this runs in the
+     * harness too, where no DI container exists; `auth_user` is a plain
+     * session key, and the rule is symmetric with MemberAuthBridge, which
+     * clears THIS session when a backend login came last.
+     *
+     * The tenant choice is cleared here too: it belonged to whoever was signed
+     * in before, and a fresh sign-in (also the device-key resume) starts on
+     * the home. A choice must never survive an account switch.
+     */
+    public function start(string $accountId, ?int $now = null): void
+    {
+        $this->regenerate();
+        $this->session->remove('auth_user');
+        $this->session->remove(self::KEY_ACTIVE_TENANT);
+        $this->clearTotpEnrolment();
+        $this->session->set(self::KEY_ACCOUNT, $accountId);
+        $this->session->set(self::KEY_LAST_SEEN, $now ?? time());
+    }
+
+    /**
+     * The signed-in account id, or null — none, or idle-expired (the session
+     * ends right there). A live read refreshes the idle clock (rolling), unless
+     * $isActivity is false: a live listener's question reads without counting.
+     */
+    public function currentAccountId(?int $now = null, bool $isActivity = true): ?string
+    {
+        $accountId = $this->session->get(self::KEY_ACCOUNT);
+        if (!is_string($accountId) || $accountId === '') {
+            return null;
+        }
+
+        $now      = $now ?? time();
+        $lastSeen = (int)$this->session->get(self::KEY_LAST_SEEN, 0);
+        if ($now - $lastSeen > self::IDLE_SECONDS) {
+            $this->end();
+
+            return null;
+        }
+
+        if ($isActivity) {
+            $this->session->set(self::KEY_LAST_SEEN, $now);
+        }
+
+        return $accountId;
+    }
+
+    /**
+     * Cheap presence probe for the AuthBridge: any sign of a member sign-in
+     * (live or TOTP-pending) without touching the idle clock or the store.
+     */
+    public function hasTraces(): bool
+    {
+        return $this->session->get(self::KEY_ACCOUNT) !== null
+            || $this->session->get(self::KEY_TOTP_PENDING) !== null;
+    }
+
+    /** Signs out: member keys gone, fresh session id for whatever comes next. */
+    public function end(): void
+    {
+        $this->session->remove(self::KEY_ACCOUNT);
+        $this->session->remove(self::KEY_LAST_SEEN);
+        $this->session->remove(self::KEY_ACTIVE_TENANT);
+        $this->clearTotpEnrolment();
+        $this->clearTotpPending();
+        $this->regenerate();
+    }
+
+    // ── the tenant choice (ADR-037) ────────────────────────────────────────
+
+    /** The raw choice, unvalidated — see the key's docblock; callers go through TenantChoice. */
+    public function activeTenantRef(): ?string
+    {
+        $ref = $this->session->get(self::KEY_ACTIVE_TENANT);
+
+        return is_string($ref) && $ref !== '' ? $ref : null;
+    }
+
+    public function setActiveTenantRef(?string $tenantRef): void
+    {
+        if ($tenantRef === null || $tenantRef === '') {
+            $this->session->remove(self::KEY_ACTIVE_TENANT);
+
+            return;
+        }
+        $this->session->set(self::KEY_ACTIVE_TENANT, $tenantRef);
+    }
+
+    // ── the TOTP interstitial (B8 stage B) ─────────────────────────────────
+
+    /**
+     * The redeemed link parks here when 2FA is active — no session yet. The
+     * link's «angemeldet bleiben» wish waits here too: the device key may only
+     * be issued once the second factor is in (stage C).
+     *
+     * Closes the backend door here already, like {@see start()}: the redeemed
+     * link is the proof, the code prompt only completes it. Leaving
+     * `auth_user` in place would make the bridge treat this browser as
+     * «backend came last» and wipe the pending state before the code page
+     * renders — 2FA would be unusable while a backend session exists.
+     */
+    public function startTotpPending(string $accountId, bool $remember = false, ?int $now = null): void
+    {
+        $this->regenerate();
+        $this->session->remove('auth_user');
+        $this->session->set(self::KEY_TOTP_PENDING, $accountId);
+        $this->session->set(self::KEY_TOTP_SINCE, $now ?? time());
+        $this->session->set(self::KEY_TOTP_REMEMBER, $remember);
+    }
+
+    /** Did the link that parks at the code prompt ask to stay signed in? */
+    public function totpPendingRemember(): bool
+    {
+        return (bool)$this->session->get(self::KEY_TOTP_REMEMBER, false);
+    }
+
+    /** Account waiting at the code prompt, or null (none / took too long). */
+    public function totpPendingAccountId(?int $now = null): ?string
+    {
+        $accountId = $this->session->get(self::KEY_TOTP_PENDING);
+        if (!is_string($accountId) || $accountId === '') {
+            return null;
+        }
+        if (($now ?? time()) - (int)$this->session->get(self::KEY_TOTP_SINCE, 0) > self::TOTP_PENDING_SECONDS) {
+            $this->clearTotpPending();
+
+            return null;
+        }
+
+        return $accountId;
+    }
+
+    public function clearTotpPending(): void
+    {
+        $this->session->remove(self::KEY_TOTP_PENDING);
+        $this->session->remove(self::KEY_TOTP_SINCE);
+        $this->session->remove(self::KEY_TOTP_REMEMBER);
+    }
+
+    // ── the running 2FA setup ──────────────────────────────────────────────
+
+    public function setTotpEnrolment(string $accountId, int $at, string $ciphertext): void
+    {
+        $this->session->set(self::KEY_TOTP_ENROLMENT, ['account_id' => $accountId, 'at' => $at, 'secret' => $ciphertext]);
+    }
+
+    /** @return array{account_id:string, at:int, secret:string}|null */
+    public function totpEnrolment(): ?array
+    {
+        $pending = $this->session->get(self::KEY_TOTP_ENROLMENT);
+        if (!is_array($pending) || !is_string($pending['account_id'] ?? null) || !is_string($pending['secret'] ?? null)) {
+            return null;
+        }
+
+        return ['account_id' => $pending['account_id'], 'at' => (int) ($pending['at'] ?? 0), 'secret' => $pending['secret']];
+    }
+
+    public function clearTotpEnrolment(): void
+    {
+        $this->session->remove(self::KEY_TOTP_ENROLMENT);
+    }
+
+    // ── the waiting login (B8 stage D) ─────────────────────────────────────
+
+    /**
+     * The requesting device remembers ITS waiting record here — and nowhere
+     * else. That binding is the whole access control of the status poll: only
+     * the browser that asked can ask how it went.
+     */
+    public function setPendingLoginId(string $pendingId): void
+    {
+        $this->session->set(self::KEY_PENDING_LOGIN, $pendingId);
+    }
+
+    public function pendingLoginId(): ?string
+    {
+        $id = $this->session->get(self::KEY_PENDING_LOGIN);
+
+        return is_string($id) && $id !== '' ? $id : null;
+    }
+
+    public function clearPendingLogin(): void
+    {
+        $this->session->remove(self::KEY_PENDING_LOGIN);
+    }
+
+    private function regenerate(): void
+    {
+        if (PHP_SAPI !== 'cli') {
+            $this->session->regenerate();
+        }
+    }
+}

@@ -1,0 +1,308 @@
+<?php
+namespace Z77\Module\Member\Ui;
+
+use Z77\Core\DI,
+    Z77\Core\Http\Response\FetchResponse,
+    Z77\Core\Http\Response\HtmlResponse,
+    Z77\Module\Member\Entities\MemberAccount,
+    Z77\Module\Member\Services\MemberAccounts,
+    Z77\Module\Member\Services\RegistrationFlow,
+    Z77\Module\Member\Services\TenantChoice,
+    Z77\Persistence\Resolver\DataSourceResolver,
+    Z77\Persistence\Resolver\UnifiedEntityManager,
+    Z77\Shared\Attributes\Fetch,
+    Z77\Shared\Attributes\HttpMethod
+;
+
+/**
+ * The member accounts surface (B7 backend handgrip) — mounted by a thin host
+ * controller in the backend (dms Drive pattern, ADR-018): the host provides
+ * route + auth + shell, all logic and templates live here in module-member.
+ * Host side: `use AccountsControllerTrait` + a one-line layout config
+ * delegating to {@see AccountsLayout::config()}.
+ *
+ * Actions on an account follow the spec exactly: «Freischalten» (confirmed →
+ * active, fires the project hook, sends the activation mail) and «Ablehnen»
+ * (delete, NO automatic mail). A failing hook leaves the account 'confirmed'
+ * and surfaces as an error flash — no active account without its project side.
+ *
+ * ⚠️ What this list KNOWS about a project (ADR-038): nothing of its own. The
+ * sentence a waiting row needs — «creates a tenant» or «attaches to X» — is
+ * read from the project's membership hook: an account with no membership
+ * reported creates one on activation, an account with a pending one attaches.
+ * Until 2026-09-13 the account itself carried the reference, and this list
+ * also showed and activated «grants»; those rows are the project's now, in
+ * the project's own backend.
+ */
+trait AccountsControllerTrait
+{
+    private const MEMBER_NS = 'Z77\\Module\\Member';
+
+    private function memberAccounts(): MemberAccounts
+    {
+        return new MemberAccounts(new UnifiedEntityManager(new DataSourceResolver(['file' => 'File'])));
+    }
+
+    private function memberFlow(): RegistrationFlow
+    {
+        return RegistrationFlow::create($this->memberAbsoluteUrl('/member/main/confirm'));
+    }
+
+    /** The project's memberships, read without a session — the operator's list chooses nothing. */
+    private function memberChoice(): TenantChoice
+    {
+        return new TenantChoice(null, TenantChoice::hookFromConfig());
+    }
+
+    /** Mail links (activation, confirm) — origin from the configured canonical base URL, not the Host header. */
+    private function memberAbsoluteUrl(string $path): string
+    {
+        return DI::getRequest()->getBaseUrl() . $path;
+    }
+
+    /**
+     * The set this mount shows. A host narrows it: a client project mounts one list per way
+     * in — open registration, invitation, rejected — so the operator never sorts
+     * one long list by eye to find what waits for HIM (B10 v1.17.0).
+     *
+     * @return list<MemberAccount>
+     */
+    protected function memberListRows(): array
+    {
+        return $this->memberAccounts()->all();
+    }
+
+    /** Heading of the list — a narrowed mount says what it shows. */
+    protected function memberListTitle(): string
+    {
+        return 'Member-Konten';
+    }
+
+    /** The sentence for the empty list. Belongs to the mount, not to the trait. */
+    protected function memberListEmpty(): string
+    {
+        return 'Keine Registrierungen vorhanden.';
+    }
+
+    /**
+     * URL root of THIS mount — every row button and every modal form is built
+     * from it.
+     *
+     * ⚠️ It used to be hard-coded as '/backend/service/member-accounts' in four
+     * templates. With a second mount that is a silent trap: the deed lands (the
+     * action is the same code), but the `reload` afterwards refreshes the FIRST
+     * mount's list — the operator watches a page that never changes and clicks
+     * again.
+     */
+    protected function memberListBase(): string
+    {
+        return '/backend/service/member-accounts';
+    }
+
+    /**
+     * One short sentence per account that the MOUNT wants on the row, keyed by
+     * account id. Empty by default — the module has nothing to say about an
+     * account beyond its state.
+     *
+     * The seam exists because a waiting decision is better made with the
+     * project's knowledge than without it: a client project marks the registrations that
+     * brought a drawing along, so the operator activates knowing there is a
+     * package hanging on that account (B5 stage D4). The template renders the
+     * note as an intent badge and escapes it; nothing here interprets it.
+     *
+     * @param  list<MemberAccount> $rows
+     * @return array<string,string>
+     */
+    protected function memberRowNotes(array $rows): array
+    {
+        return [];
+    }
+
+    protected function listAction(): HtmlResponse
+    {
+        // Waiting decisions first: confirmed accounts are the operator's queue.
+        $order = ['confirmed' => 0, 'registered' => 1, 'active' => 2];
+        $rows  = $this->memberListRows();
+        usort($rows, static fn($a, $b) =>
+            [$order[$a->getState()] ?? 9, $a->getCreatedAt()] <=> [$order[$b->getState()] ?? 9, $b->getCreatedAt()]);
+
+        // The list's help closes its toolbar (HELP-003), beside the «warten auf Freischaltung» status.
+        $this->help->attach('Backend/AccountsController/list.help', self::MEMBER_NS, [], 'Hilfe: Member-Konten', toolbar: true);
+        return $this->html([
+            'accounts'     => $rows,
+            'memberships'  => $this->memberMemberships($rows),
+            // ⚠️ Deliberately NOT named `title`/`path`: TemplateRenderer does
+            // extract(..., EXTR_SKIP), and a context key that collides with an
+            // existing variable is dropped WITHOUT a word.
+            'rowNotes'     => $this->memberRowNotes($rows),
+            'actionBase'   => $this->memberListBase(),
+            'listTitle'    => $this->memberListTitle(),
+            'listEmpty'    => $this->memberListEmpty(),
+        ]);
+    }
+
+    /**
+     * The project's memberships per account, keyed by account id — what the
+     * row and the activation dialog say about a reference comes from here and
+     * from nowhere else. An account the project reports nothing for has none:
+     * its activation CREATES a reference (open registration); one with a
+     * pending membership ATTACHES to it (an invitation). That is precisely
+     * the difference nobody can see any more once it has been decided wrongly.
+     *
+     * @param  list<MemberAccount> $rows
+     * @return array<string, list<array{ref:string,label:string,usable:bool,note:string}>>
+     */
+    private function memberMemberships(array $rows): array
+    {
+        $choice = $this->memberChoice();
+        $map    = [];
+        foreach ($rows as $account) {
+            $map[(string)$account->getId()] = $choice->memberships($account);
+        }
+
+        return $map;
+    }
+
+    /** Confirm modal for activation (entity-token guarded, like the reset modals). */
+    protected function confirmActivateAction(): HtmlResponse|FetchResponse
+    {
+        return $this->memberConfirmModal('confirmActivate');
+    }
+
+    /** Confirm modal for rejection. */
+    protected function confirmRejectAction(): HtmlResponse|FetchResponse
+    {
+        return $this->memberConfirmModal('confirmReject');
+    }
+
+    /** Confirm modal for the 2FA reset (lost device — B8 spec handgrip). */
+    protected function confirmTotpResetAction(): HtmlResponse|FetchResponse
+    {
+        return $this->memberConfirmModal('confirmTotpReset');
+    }
+
+    #[Fetch, HttpMethod('POST')]
+    protected function totpResetAction(): FetchResponse
+    {
+        [$account, $error] = $this->memberAccountFromPost();
+        if ($error !== null) {
+            return $error;
+        }
+        if (!$account->hasTotp() && !$account->hasPendingTotpSetup()) {
+            return $this->fetchError('Für dieses Konto ist kein Zwei-Faktor-Schutz eingerichtet');
+        }
+
+        \Z77\Module\Member\Services\MemberLog::actor('operator');
+        \Z77\Module\Member\Services\TotpSetup::create()->resetByOperator($account);
+        $this->messageService->pushFlashAfterRedirect(
+            'success',
+            'Zwei-Faktor-Schutz für «' . $account->getEmail() . '» zurückgesetzt — der Kunde richtet neu ein.'
+        );
+
+        return $this->fetch()->setStatus('success')->addCommand('close-modal')->addCommand('reload');
+    }
+
+    #[Fetch, HttpMethod('POST')]
+    protected function activateAction(): FetchResponse
+    {
+        [$account, $error] = $this->memberAccountFromPost();
+        if ($error !== null) {
+            return $error;
+        }
+        if (!$account->isConfirmed()) {
+            return $this->fetchError('Nur bestätigte Konten können freigeschaltet werden');
+        }
+
+        try {
+            $this->memberFlow()->activate($account, $this->memberAbsoluteUrl($this->memberEntryPath()));
+        } catch (\Throwable $e) {
+            // Hook failed — account stays 'confirmed' (MemberAccounts contract).
+            $this->messageService->pushFlashAfterRedirect(
+                'error',
+                'Freischaltung fehlgeschlagen — das Konto bleibt «bestätigt»: ' . $e->getMessage()
+            );
+
+            return $this->fetch()->setStatus('success')->addCommand('close-modal')->addCommand('reload');
+        }
+
+        $this->messageService->pushFlashAfterRedirect(
+            'success',
+            'Konto «' . $account->getEmail() . '» freigeschaltet — die Mail an den Kunden ist unterwegs.'
+        );
+
+        return $this->fetch()->setStatus('success')->addCommand('close-modal')->addCommand('reload');
+    }
+
+    #[Fetch, HttpMethod('POST')]
+    protected function rejectAction(): FetchResponse
+    {
+        [$account, $error] = $this->memberAccountFromPost();
+        if ($error !== null) {
+            return $error;
+        }
+        if ($account->isActive()) {
+            return $this->fetchError('Aktive Konten können nicht abgelehnt werden');
+        }
+
+        try {
+            $this->memberFlow()->reject($account);
+        } catch (\Throwable $e) {
+            // The project refused (accountDeletionHook) — nothing has changed.
+            return $this->fetchError('Ablehnen nicht möglich: ' . $e->getMessage());
+        }
+        $this->messageService->pushFlashAfterRedirect(
+            'success',
+            'Konto «' . $account->getEmail() . '» gelöscht — es wird keine automatische Mail versandt.'
+        );
+
+        return $this->fetch()->setStatus('success')->addCommand('close-modal')->addCommand('reload');
+    }
+
+    // ── shared plumbing ────────────────────────────────────────────────────
+
+    private function memberConfirmModal(string $template): HtmlResponse|FetchResponse
+    {
+        $id      = trim((string)DI::getRequest()->getGetParameter('id'));
+        $account = $id !== '' ? $this->memberAccounts()->findById($id) : null;
+        if ($account === null) {
+            return $this->fetchError('Konto nicht gefunden');
+        }
+
+        $response = $this->html([
+            'account'     => $account,
+            'memberships' => $this->memberChoice()->memberships($account),
+            'entityCsrf'  => DI::getCsrfService()->generateEntityToken('memberAccount', $id),
+            'actionBase'  => $this->memberListBase(),
+        ]);
+        $this->layoutManager->addPartials($template, 'Backend/AccountsController', self::MEMBER_NS);
+
+        return $response;
+    }
+
+    /** @return array{0: ?MemberAccount, 1: ?FetchResponse} */
+    private function memberAccountFromPost(): array
+    {
+        $body = DI::getRequest()->getJsonBody();
+        $id   = trim((string)($body['account_id'] ?? ''));
+        if ($id === '') {
+            return [null, $this->fetchError('Konto-Id fehlt')];
+        }
+        if (!DI::getCsrfService()->validateEntityToken(trim((string)($body['entity_csrf'] ?? '')), 'memberAccount', $id)) {
+            return [null, $this->fetchError('Invalid token')];
+        }
+        $account = $this->memberAccounts()->findById($id);
+        if ($account === null) {
+            return [null, $this->fetchError('Konto nicht gefunden')];
+        }
+
+        return [$account, null];
+    }
+
+    /** The member entry path from the module config (the activation mail links to it). */
+    private function memberEntryPath(): string
+    {
+        return (string)DI::getConfigManager()
+            ->getArrayConfig('App/Config/memberConfig', self::MEMBER_NS)
+            ->get('memberEntryPath', '/');
+    }
+}

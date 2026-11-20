@@ -1,0 +1,133 @@
+<?php
+/**
+ * Member accounts list (B7 backend handgrip) — readable without prose, like
+ * the email-settings list: state as a colored badge, the waiting decision
+ * carries its actions as explicit buttons on the row. Confirmed accounts sort
+ * first (the operator's queue), then registered, then active.
+ *
+ *   bestätigt   → amber badge + «Freischalten» / «Ablehnen»
+ *   registriert → muted badge + «Ablehnen» (never confirmed; cleanup also
+ *                 removes them after the grace period)
+ *   aktiv       → green badge, tenant reference shown, no actions (B8/B10)
+ *
+ * ⚠️ A waiting row MUST say which of the two activations it is (B10 v1.6.0):
+ * one CREATES a tenant (open registration), the other ATTACHES to an existing
+ * one (an invitation — the project reports a pending membership). Without
+ * that sentence one activates blind, and the difference is exactly the one
+ * nobody can see afterwards.
+ *
+ * @var list<\Z77\Module\Member\Entities\MemberAccount> $accounts
+ * @var array<string, list<array{ref:string,label:string,usable:bool,note:string}>> $memberships
+ *      the project's memberships per account id (ADR-038, `membershipHook`)
+ * @var string $actionBase  URL root of THIS mount — see memberListBase()
+ * @var string $listTitle
+ * @var string $listEmpty
+ * @var array<string,string> $rowNotes  account id -> one short sentence the MOUNT
+ *      wants on that row (memberRowNotes()). Neutral seam: the module does not
+ *      know what a project has to say about an account, only that a waiting
+ *      decision is better made with it than without.
+ */
+$badge = static fn(string $state): array => match ($state) {
+    'confirmed' => ['badge--warning', 'bestätigt — wartet'],
+    'active'    => ['badge--success', 'aktiv'],
+    default     => ['badge--muted', 'registriert'],
+};
+// Fallbacks keep an older mount that passes none of the three working.
+$actionBase   = $actionBase ?? '/backend/service/member-accounts';
+$listTitle    = $listTitle  ?? 'Member-Konten';
+$listEmpty    = $listEmpty  ?? 'Keine Registrierungen vorhanden.';
+$memberships  = $memberships ?? [];
+$rowNotes     = $rowNotes ?? [];
+// The labels of an account's memberships, joined — for the active row.
+$labelsOf     = static fn(array $rows): string => implode(', ', array_map(
+    static fn(array $m): string => (string)$m['label'], $rows
+));
+?>
+<div class="be-list">
+    <div class="be-list__section">
+        <div class="be-list__section-header">
+            <h2 class="be-list__section-title"><?= e($listTitle) ?></h2>
+            <span class="be-list__section-badge"><?= count($accounts) ?></span>
+        </div>
+        <div class="be-tree be-tree--hub be-tree--lead-none">
+            <?php if (empty($accounts)): ?>
+            <p style="font-size:.8rem;color:var(--be-muted,#94a3b8);padding:.5rem"><?= e($listEmpty) ?></p>
+            <?php endif; ?>
+            <?php foreach ($accounts as $account): ?>
+            <?php [$badgeClass, $badgeLabel] = $badge($account->getState()); ?>
+            <div class="be-tree__node" style="--node-depth:0" data-account-id="<?= e((string)$account->getId()) ?>">
+                <div class="be-tree__row">
+                    <span class="be-tree__toggle" aria-hidden="true"></span>
+
+                    <span class="be-tree__name" data-field="email">
+                        <?= e($account->getEmail()) ?>
+                        <span style="font-size:.75rem;color:var(--be-muted,#94a3b8)">
+                            <?= e(trim(($account->getFirstName() ?? '') . ' ' . ($account->getLastName() ?? ''))) ?>
+                            <?= $account->getCompany() !== null ? '· ' . e($account->getCompany()) : '' ?>
+                        </span>
+                    </span>
+
+                    <span class="be-tree__url" data-field="dates" style="font-size:.75rem;color:var(--be-muted,#94a3b8)">
+                        registriert <?= e(substr((string)$account->getCreatedAt(), 0, 10)) ?>
+                        <?php if ($account->getConfirmedAt() !== null): ?>
+                        · bestätigt <?= e(substr((string)$account->getConfirmedAt(), 0, 10)) ?>
+                        <?php endif; ?>
+                        <?php $mine = $memberships[(string)$account->getId()] ?? []; ?>
+                        <?php if ($mine !== []): ?>
+                        · Mandant <?= e($labelsOf($mine)) ?>
+                        <?php endif; ?>
+
+                        <?php /* The one sentence that keeps an activation from
+                                 being blind (B10 v1.6.0). Only on the waiting
+                                 row — once active, what happened is history. */ ?>
+                        <?php if ($account->isConfirmed()): ?>
+                            <?php if ($mine === []): ?>
+                        <br><strong>Freischaltung erzeugt einen neuen Mandanten</strong>
+                                <?php /* Über welchen Knopf die Registrierung
+                                         kam. Steht direkt beim Satz, der die
+                                         Freischaltung beschreibt: was danach
+                                         zu tun ist, hängt genau daran. */ ?>
+                                <?php if ($account->getOrigin() !== null): ?>
+                        — über «<?= e($account->getOrigin()) ?>»
+                                <?php endif; ?>
+                            <?php else: ?>
+                        <br><strong>Freischaltung hängt an «<?= e($labelsOf($mine)) ?>» an</strong>
+                                <?php /* The project's own sentence about the
+                                         pending membership («eingeladen von …») —
+                                         printed, never interpreted. */ ?>
+                                <?php if (($mine[0]['note'] ?? '') !== ''): ?>
+                        — <?= e($mine[0]['note']) ?>
+                                <?php endif; ?>
+                            <?php endif; ?>
+                        <?php endif; ?>
+                    </span>
+
+                    <span class="be-tree__route" data-field="state" style="display:inline-flex;gap:.5rem;align-items:center">
+                        <span class="badge <?= e($badgeClass) ?>"><?= e($badgeLabel) ?></span>
+                        <?php $note = $rowNotes[(string) $account->getId()] ?? ''; ?>
+                        <?php if ($note !== ''): ?>
+                        <span class="badge badge--info" data-field="note"><?= e($note) ?></span>
+                        <?php endif; ?>
+                        <?php if ($account->isConfirmed()): ?>
+                        <button type="button" class="be-btn be-btn--sm"
+                                title="Konto aktiv schalten — erzeugt die Projekt-Anbindung und sendet die Freischalt-Mail"
+                                data-fetch-get="<?= e($actionBase) ?>/confirm-activate?id=<?= e(rawurlencode((string)$account->getId())) ?>">Freischalten</button>
+                        <?php endif; ?>
+                        <?php if (!$account->isActive()): ?>
+                        <button type="button" class="be-btn be-btn--ghost be-btn--sm"
+                                title="Konto löschen — ohne automatische Mail"
+                                data-fetch-get="<?= e($actionBase) ?>/confirm-reject?id=<?= e(rawurlencode((string)$account->getId())) ?>">Ablehnen</button>
+                        <?php endif; ?>
+                        <?php if ($account->hasTotp()): ?>
+                        <button type="button" class="be-btn be-btn--ghost be-btn--sm"
+                                title="Zwei-Faktor-Schutz entfernen — nur bei verlorenem Gerät"
+                                data-fetch-get="<?= e($actionBase) ?>/confirm-totp-reset?id=<?= e(rawurlencode((string)$account->getId())) ?>">2FA-Reset</button>
+                        <?php endif; ?>
+                    </span>
+                </div>
+            </div>
+            <?php endforeach; ?>
+        </div>
+    </div>
+
+</div>

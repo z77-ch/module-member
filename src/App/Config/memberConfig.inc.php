@@ -1,0 +1,316 @@
+<?php
+namespace Z77\Module\Member\App;
+
+use Z77\Core\Config\AuthRole;
+use Z77\Module\Member\Services\MemberAuthBridge;
+
+/**
+ * Member module — registration with confirmed e-mail (B7 origin).
+ *
+ * A view-area of its own with a deliberately minimal layout (see
+ * Ui/Config/layoutConfig.inc.php — override whole per project to restyle).
+ * All registration pages are GUEST by nature: the module's whole point is
+ * that nobody is logged in yet.
+ *
+ * Routes (convention: /member/{group}/{controller}/{action}):
+ *   /member/main/register          the form (GET render / POST submit)
+ *   /member/main/register/danke    PRG target
+ *   /member/main/register/check    per-field blur validation (fetch)
+ *   /member/main/confirm?token=…   confirmation landing
+ *   /member/main/resend            request a fresh link (+ danke, check)
+ */
+return [
+    'defaultGroup'  => 'main',
+    'groupDefaults' => [
+        'main' => 'register',
+    ],
+    'defaultAction' => 'index',
+
+    // FQCN of an invokable class `__invoke(MemberAccount): void` — the
+    // project side of activation (e.g. a client project: creates the tenant and the OWNER
+    // membership, or activates a pending one). Nothing it returns is stored:
+    // since ADR-038 the account carries no project reference. Null =
+    // accounts activate without a project attachment. A project sets this
+    // by overriding THIS FILE whole (override tree, first match wins).
+    'activationHook' => null,
+
+    // FQCN of an invokable class `__invoke(string $ref): string` — turns a
+    // project reference into a readable name. The invitation mail and the
+    // backend account row need it; the module knows no tenants, so without a
+    // project hook they fall back to showing the bare reference.
+    'tenantLabelHook' => null,
+
+    // The word for what a member works FOR, as the member pages and mails
+    // name it (2026-10-31, a client project): singular, plural, gender f/m/n —
+    // articles follow the gender ({@see \Z77\Module\Member\Services\TenantNoun}).
+    // e.g. ['singular' => 'Projekt', 'plural' => 'Projekte', 'gender' => 'n'].
+    // Empty = «Verwaltung / Verwaltungen / f», the wording before the key.
+    'tenantNoun' => [],
+
+    // ADR-038 (2026-09-13): the module knows no project reference. WHICH
+    // references an account may work for — and which one it is working for
+    // right now — is the PROJECT's list, kept at its tenant. This hook is how
+    // the module asks: FQCN of an invokable class
+    //   `__invoke(MemberAccount): list<array{ref:string, label:string, usable:bool, note?:string}>`
+    // — every membership of the account in the project's order, `usable`
+    // false for a paused or not-yet-activated one, `note` an optional short
+    // sentence for the backend list («eingeladen von …»). The FIRST usable
+    // entry is the fallback choice. Null = no memberships anywhere: no
+    // switcher, no choice, no invitations (an installation without tenants).
+    // Read through {@see \Z77\Module\Member\Services\TenantChoice}.
+    'membershipHook' => null,
+
+    // The other direction of the same seam: when an invitation is redeemed,
+    // the module has created the account (if the address was new) and
+    // consumed the token — and then tells the project WHO joined WHAT.
+    // FQCN of an invokable class
+    //   `__invoke(MemberAccount $account, string $ref, ?string $invitedBy): void`
+    // ($invitedBy = the inviting account's id, or `operator:<backend id>` when a
+    // backend user invited — InvitationFlow::inviteAsOperator()). The project writes the
+    // membership (pending, like a `confirmed` account) and activates it
+    // later on its own list. Null = nothing is attached.
+    'joinHook' => null,
+
+    // An AREA of the shell that is not for everyone — the module derives the
+    // areas from the nav slot `member-main`, and a nav entry is data that
+    // cannot say «only for the owner». FQCN of an invokable class
+    //   `__invoke(MemberAccount $account, string $target): bool`
+    // ($target = `controller/action`, lower-case); false drops the entry
+    // from switcher AND rail («not present, not forbidden»). The area's
+    // own controller still answers a direct URL on its own — this is the
+    // display half. Null = every entry in the slot is shown to everyone.
+    'areaVisibilityHook' => null,
+
+    // The person deletes her own account (2026-09-14; Art. 32 revDSG). The
+    // module removes account, devices, 2FA and tokens; the PROJECT is asked
+    // FIRST — FQCN of an invokable class
+    //   `__invoke(MemberAccount): ?string`  detach the person at the project
+    //                                       (memberships, a tenant left
+    //                                       without owner); return one short
+    //                                       fact for the account log; THROW
+    //                                       to refuse — nothing is deleted
+    //   `notice(MemberAccount): list<string>` optional — sentences the dialog
+    //                                       shows before the person confirms
+    // Read through {@see \Z77\Module\Member\Services\AccountDeletion}. Null =
+    // nothing to detach; the account still dies.
+    'accountDeletionHook' => null,
+
+    // Registrierungs-Herkunft: der Registrier-Link darf `?via=<slug>` tragen,
+    // und der Slug wird am Konto festgehalten (MemberAccount::$origin). Er
+    // aendert nichts am Weg — er sagt der Person, die freischaltet, WELCHES
+    // Angebot geklickt wurde, und danach richtet sich, was danach zu tun ist.
+    // Hier steht der Satz, den die Registrierseite dazu zeigt; ein Slug ohne
+    // Eintrag zeigt keinen. Das Modul kennt keine Angebote, also ist die Liste
+    // leer und das Projekt fuellt sie.
+    'originNotes' => [],
+
+    // B7 v1.1.0: how many invitations one PROJECT REFERENCE may send per day.
+    // Per reference, not per address — an address counter would let a taken-
+    // over master account invite by the dozen, one each to a fresh recipient.
+    'invitesPerTenantPerDay' => 10,
+
+    // Path the «Sie sind freigeschaltet» mail links to (absolute URL is built
+    // from the request host at send time) — the B8 login page.
+    'memberEntryPath' => '/member/main/login',
+
+    // Daily cleanup (job 'member-cleanup', or bin/member-cleanup.php by hand):
+    // never-confirmed accounts older than this are deleted; 'confirmed'
+    // accounts always wait for an operator.
+    'cleanupAfterDays' => 30,
+
+    // Extra lines the PROJECT wants in the operator notification («eine
+    // Registrierung wartet auf die Freischaltung»). FQCN of an invokable
+    // class `__invoke(MemberAccount): array<string,string>` — label => value.
+    //
+    // The module has nothing to add there: it knows an account, not what a
+    // project attaches to one. One client project uses it to say that a submitted drawing
+    // came along, so the operator activates with the full picture instead of
+    // getting a second mail about it. Absent = no extra lines.
+    //
+    // ⚠️ The values are printed and escaped, never interpreted. A hook that
+    // throws is swallowed: an operator notification must never be the reason
+    // a confirmation fails.
+    'notifyRowsHook' => '',
+
+    // Background jobs this module offers to the runner (ADR-031). The key is
+    // what a queue entry stores — never a class name or a script path, so a
+    // backend form can only ever pick from this list.
+    //
+    // No 'defaultSchedule': `member-cleanup` DELETES, so an operator switches
+    // it on (the delete-vs-schedule rule, see docs/topics/jobs.md).
+    //
+    // NOTE: `geoip-update` used to be registered here, when module-member was
+    // the only consumer of country data. The geo guard is a kernel capability
+    // of every public form now, so the job is registered by `backendConfig`
+    // (beside `form-log-cleanup`). ⚠️ A project override of THIS file that
+    // still carries the entry makes the job key a double declaration — the
+    // registry refuses that fail-fast; delete it from the override.
+    'jobs' => [
+        'member-cleanup' => [
+            'class'       => \Z77\Module\Member\Jobs\MemberCleanupJob::class,
+            'label'       => 'Member-Bereinigung',
+            'runAs'       => AuthRole::CRON_JOB,
+            'maxAttempts' => 3,
+        ],
+    ],
+
+    // How many login links one address and one browser may trigger per hour.
+    // Feeds BOTH layers: the per-address throttle (file-based, survives a new
+    // session) and the login form's per-session limit (silent — the waiting
+    // page appears either way, MEM-005/MEM-010). It protects a stranger's
+    // mailbox from being flooded through this form; raise it where support or
+    // testing needs more headroom.
+    'loginRequestsPerHour' => 5,
+
+    // How many login mails one origin may trigger per hour, whatever the
+    // address: the address counter above does not hold someone who invents a
+    // new address on every try. Silent like it, the waiting page appears
+    // either way. Generous on purpose: one address can be a whole office.
+    'loginRequestsPerHourPerIp' => 30,
+
+    // The name an authenticator app shows for this account's code, set when
+    // someone sets up 2FA. Empty = the installation's name or host
+    // ({@see \Z77\Module\Member\Services\MemberTotp::issuer()}). Only a label:
+    // existing secrets keep working and keep the name they were given.
+    'totpIssuer' => '',
+
+    // NOTE: the blocked countries used to sit here as `blockedCountries`.
+    // They are INSTALLATION DATA now — `data/framework/forms/blocked-countries.json`,
+    // written by the operator on Service → Formular-Protokoll
+    // ({@see \Z77\Shared\Forms\CountryBlocklist}) and applied by every form
+    // that opts into PublicFormHandler::withGeoGuard(), not just this
+    // module's. The reason: the list is only ever decided from what that
+    // installation's form log actually shows, so its config default was
+    // always empty and every real decision needed a deploy. A value like that
+    // is data, not configuration. A project that still sets `blockedCountries`
+    // here is IGNORED — nothing reads it any more.
+
+    // ADR-056 (2026-11-07, a client project): a signed-in member reads her pages in
+    // HER language — the account's (profile → Konto), not the URL's. Before the
+    // sign-in only the URL decides (`/fr/member/main/login`). With it, the
+    // profile offers the languages of `languages` below (at least two) and a
+    // self-registration records the page's language. Off = everything as
+    // before: the URL alone decides, accounts carry no language unless an
+    // invitation gave them one. Mails go to an account in its language either
+    // way (none set = the default).
+    'languageFromAccount' => false,
+
+    // The languages this area offers (i18n.md, per-module switch): the choice
+    // on the profile (only with `languageFromAccount`) and the guest's switch.
+    // Must contain the default language. Empty = the default language only,
+    // no switch, no choice.
+    //   'languages' => ['de', 'fr', 'en'],
+
+    // Where a member lands after a successful login — the redeemed link, the
+    // confirmed second factor, the waiting page's poll, and a visit to the
+    // login while already signed in all use this one value
+    // ({@see \Z77\Module\Member\Services\LoginFlow::landingUrl}). Own
+    // installation only: anything that is not a path starting with `/` falls
+    // back to the default, so a config edit can never redirect a fresh login
+    // off the site. The module default is the profile, because that is the
+    // only screen a bare member module has; a project with a management area
+    // points this at that area.
+    'afterLoginUrl' => '/member/main/profile',
+
+    'viewArea'      => true,
+    'viewAreaLabel' => 'Member',
+    'public'        => true,
+    'navSlots'      => [
+        'main' => 'Hauptnavigation',
+    ],
+    'moduleRole'    => AuthRole::GUEST,
+
+    // The member login feeds the framework ACL (ADR-029, second decision):
+    // the bridge projects the member session into `auth_user` (realm member,
+    // role `customer`) before AccessGuard runs — protected routes below carry
+    // AuthRole::CUSTOMER instead of guarding themselves.
+    'authBridges'   => [MemberAuthBridge::class],
+
+    // Where AccessGuard sends a visitor who lacks the required role in THIS
+    // module — the member login, not the admin login.
+    'loginUrl'      => '/member/main/login',
+
+    // Form pages carry CSRF tokens and per-user state — never page-cached.
+    'cache' => [
+        'enabled' => false,
+    ],
+
+    'controllers' => [
+        'main' => [
+            'RegisterController' => [
+                'defaultAction'  => 'index',
+                'controllerRole' => AuthRole::GUEST,
+                'actions'        => [
+                    'indexAction' => AuthRole::GUEST,
+                    'dankeAction' => AuthRole::GUEST,
+                    'checkAction' => AuthRole::GUEST,
+                ],
+            ],
+            'ConfirmController' => [
+                'defaultAction'  => 'index',
+                'controllerRole' => AuthRole::GUEST,
+                'actions'        => [
+                    'indexAction' => AuthRole::GUEST,
+                ],
+            ],
+            'ResendController' => [
+                'defaultAction'  => 'index',
+                'controllerRole' => AuthRole::GUEST,
+                'actions'        => [
+                    'indexAction' => AuthRole::GUEST,
+                    'dankeAction' => AuthRole::GUEST,
+                    'checkAction' => AuthRole::GUEST,
+                ],
+            ],
+            // B8 — login is GUEST by nature (nobody is signed in yet).
+            'LoginController' => [
+                'defaultAction'  => 'index',
+                'controllerRole' => AuthRole::GUEST,
+                'actions'        => [
+                    'indexAction'  => AuthRole::GUEST,
+                    'wartenAction' => AuthRole::GUEST,
+                    'statusAction' => AuthRole::GUEST,
+                    'dankeAction'  => AuthRole::GUEST,
+                    'redeemAction' => AuthRole::GUEST,
+                    'totpAction'   => AuthRole::GUEST,
+                    'checkAction'  => AuthRole::GUEST,
+                ],
+            ],
+            'LogoutController' => [
+                'defaultAction'  => 'index',
+                'controllerRole' => AuthRole::GUEST,
+                'actions'        => [
+                    'indexAction' => AuthRole::GUEST,
+                ],
+            ],
+            // Signed-in customers only — enforced by AccessGuard via the
+            // AuthBridge projection; a guest is sent to `loginUrl` above. The
+            // controller still loads its account through MemberAuth (it needs
+            // the entity, not just the role).
+            'ProfileController' => [
+                'defaultAction'  => 'index',
+                'controllerRole' => AuthRole::CUSTOMER,
+                'actions'        => [
+                    'indexAction'           => AuthRole::CUSTOMER,
+                    'themeAction'           => AuthRole::CUSTOMER,
+                    'kontoAction'           => AuthRole::CUSTOMER,
+                    'totpAction'            => AuthRole::CUSTOMER,
+                    'totpRemoveAction'      => AuthRole::CUSTOMER,
+                    'deviceRemoveAction'    => AuthRole::CUSTOMER,
+                    'deviceRemoveAllAction' => AuthRole::CUSTOMER,
+                    // ADR-037 — the tenant choice of a signed-in person with
+                    // more than one available reference (the header's switcher
+                    // posts here; the set comes from `membershipHook`). ⚠️ A
+                    // project's whole-file override MUST carry it too, or the
+                    // switcher silently stops working.
+                    'mandantAction'         => AuthRole::CUSTOMER,
+                ],
+            ],
+            // NOTE: `ZugaengeController` sat here from 2026-09-12 to 2026-09-13.
+            // Inviting, pausing and removing act on MEMBERSHIPS, and those are
+            // the project's rows (ADR-038) — the area moved to the project
+            // that has tenants, together with its templates. The token
+            // mechanics stayed here (`InvitationFlow`).
+        ],
+    ],
+];
